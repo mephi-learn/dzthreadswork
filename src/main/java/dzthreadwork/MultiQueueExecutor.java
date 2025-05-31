@@ -19,10 +19,11 @@ public class MultiQueueExecutor implements CustomExecutor {
     private final TimeUnit timeUnit;
     private final int minSpareThreads;
 
-    private final List<QueueWorker> workers;
-    private final List<BlockingQueue<Runnable>> taskQueues;
+    private final BlockingQueue<Runnable> taskQueue;
+    private final List<Worker> workers = new ArrayList<>();
+    private final Object workersLock = new Object();
+    private final AtomicInteger threadCounter = new AtomicInteger(0);
 
-    private final AtomicInteger queueIndex = new AtomicInteger(0);
     private volatile boolean isShutdown = false;
 
     public MultiQueueExecutor(int corePoolSize, int maxPoolSize, int queueSize,
@@ -34,23 +35,24 @@ public class MultiQueueExecutor implements CustomExecutor {
         this.timeUnit = timeUnit;
         this.minSpareThreads = minSpareThreads;
 
-        this.taskQueues = new ArrayList<>();
-        this.workers = new ArrayList<>();
+        this.taskQueue = new LinkedBlockingQueue<>(this.queueSize);
 
-        logger.info("Инициализация пула потоков: core={}, max={}, queueSize={}, keepAlive={} {}",
-                corePoolSize, maxPoolSize, queueSize, keepAliveTime, timeUnit.name());
+        logger.info("Инициализация пула потоков: core={}, max={}, queueSize={}, keepAlive={} {}, minSpare={}",
+                corePoolSize, maxPoolSize, queueSize, keepAliveTime, timeUnit.name(), minSpareThreads);
 
         for (int i = 0; i < corePoolSize; i++) {
-            createWorker(i);
+            addWorker(null);
         }
     }
 
-    private void createWorker(int index) {
-        BlockingQueue<Runnable> queue = new LinkedBlockingQueue<>(queueSize);
-        QueueWorker worker = new QueueWorker(queue, index, keepAliveTime, timeUnit);
-        taskQueues.add(queue);
-        workers.add(worker);
-        new Thread(worker, "Worker-" + index).start();
+    private void addWorker(Runnable firstTask) {
+        Worker worker = new Worker(firstTask);
+        synchronized (workersLock) {
+            workers.add(worker);
+        }
+        Thread t = new Thread(worker, "Worker-" + threadCounter.getAndIncrement());
+        t.start();
+        logger.info("Поток {} создан. Всего потоков: {}", t.getName(), getWorkerCount());
     }
 
     @Override
@@ -59,13 +61,22 @@ public class MultiQueueExecutor implements CustomExecutor {
             throw new RejectedExecutionException("Пул потоков завершён, задача отклонена.");
         }
 
-        int index = queueIndex.getAndIncrement() % taskQueues.size();
-        BlockingQueue<Runnable> queue = taskQueues.get(index);
-        if (!queue.offer(command)) {
+        boolean added = false;
+        synchronized (workersLock) {
+            if (workers.size() < corePoolSize) {
+                addWorker(command);
+                added = true;
+            } else {
+                added = taskQueue.offer(command);
+                if (!added && workers.size() < maxPoolSize) {
+                    addWorker(command);
+                    added = true;
+                }
+            }
+        }
+        if (!added) {
             throw new RejectedExecutionException("Очередь переполнена, задача отклонена.");
         }
-
-        logger.debug("Задача отправлена в очередь {}", index);
     }
 
     @Override
@@ -73,7 +84,6 @@ public class MultiQueueExecutor implements CustomExecutor {
         if (isShutdown) {
             throw new RejectedExecutionException("Пул потоков завершён, задача отклонена.");
         }
-
         FutureTask<T> futureTask = new FutureTask<>(callable);
         execute(futureTask);
         return futureTask;
@@ -81,20 +91,79 @@ public class MultiQueueExecutor implements CustomExecutor {
 
     @Override
     public void shutdown() {
+        if (isShutdown) return;
         isShutdown = true;
         logger.info("Пул переводится в режим завершения (shutdown)");
     }
 
     @Override
     public void shutdownNow() {
+        if (isShutdown) return;
         isShutdown = true;
-        logger.warn("Принудительное завершение всех потоков (shutdownNow)");
-        for (QueueWorker worker : workers) {
-            worker.stop(); // метод уже есть
+        logger.warn("Принудительное завершение всех потоков (shutdownNow). Текущий размер пула: {}", getWorkerCount());
+        synchronized (workersLock) {
+            for (Worker worker : workers) {
+                worker.stop();
+            }
         }
+        taskQueue.clear();
     }
 
     public int getWorkerCount() {
-        return workers.size();
+        synchronized (workersLock) {
+            return workers.size();
+        }
+    }
+
+    private void removeWorker(Worker worker) {
+        synchronized (workersLock) {
+            workers.remove(worker);
+        }
+    }
+
+    private class Worker implements Runnable {
+        private volatile boolean running = true;
+        private final Runnable firstTask;
+
+        public Worker(Runnable firstTask) {
+            this.firstTask = firstTask;
+        }
+
+        public void stop() {
+            running = false;
+        }
+
+        @Override
+        public void run() {
+            try {
+                Runnable task = firstTask;
+                while (running && !Thread.currentThread().isInterrupted()) {
+                    if (task != null) {
+                        try {
+                            task.run();
+                        } catch (Exception e) {
+                            logger.error("Ошибка выполнения задачи: ", e);
+                        }
+                        task = null;
+                    } else {
+                        task = taskQueue.poll(keepAliveTime, timeUnit);
+                        if (task == null) {
+                            boolean shouldExit = false;
+                            synchronized (workersLock) {
+                                if (workers.size() > minSpareThreads) {
+                                    shouldExit = true;
+                                    removeWorker(this);
+                                    logger.info("Поток {} завершён из-за простоя. Осталось потоков: {}",
+                                            Thread.currentThread().getName(), workers.size());
+                                }
+                            }
+                            if (shouldExit) break;
+                        }
+                    }
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 }
